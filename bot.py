@@ -398,6 +398,11 @@ def wizard_handler(message):
         # keep it user-friendly
         bot.reply_to(message, f"❌ Something went wrong: {e}\nType /cancel then /add to try again.")
 
+@bot.message_handler(func=lambda m: True)
+def debug_chat_id(message):
+    bot.reply_to(message, f"CHAT_ID = {message.chat.id}")
+
+
 # --------------------
 # START
 # --------------------
