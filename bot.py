@@ -321,7 +321,7 @@ def cmd_help(message):
         message,
         "👋 Household Chore Bot (rolling repeats)\n\n"
         "Setup:\n"
-        "/setpeople Alex Sam\n\n"
+        "/setpeople Wife Husband\n\n"
         "Chores:\n"
         "/add  (wizard)\n"
         "/cancel\n"
