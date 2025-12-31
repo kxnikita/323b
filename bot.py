@@ -4,13 +4,14 @@ import json
 import sqlite3
 from datetime import datetime, date, timedelta
 import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # --------------------
 # ENV
 # --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")  # Your group chat id as a string like "-100123..."
+CHAT_ID = os.getenv("CHAT_ID")  # group chat id like "-5144431873"
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN environment variable")
@@ -37,12 +38,25 @@ CREATE TABLE IF NOT EXISTS chores (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
   mode TEXT NOT NULL,              -- "fixed" or "rotate"
-  assignee TEXT NOT NULL,          -- current assignee (resolved person name)
+  assignee TEXT NOT NULL,          -- responsibility owner (stays same even if other completes)
   interval_days INTEGER NOT NULL,  -- rolling repeat interval
   time TEXT NOT NULL,              -- HH:MM
   last_done TEXT,                  -- YYYY-MM-DD
-  last_reminded TEXT,              -- YYYY-MM-DD (avoid spamming)
-  skip_until TEXT                  -- YYYY-MM-DD (skip for today)
+  last_reminded TEXT,              -- YYYY-MM-DD
+  skip_until TEXT                  -- YYYY-MM-DD
+)
+""")
+
+# Completion log (true history)
+cur.execute("""
+CREATE TABLE IF NOT EXISTS completions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chore_id INTEGER NOT NULL,
+  chore_name TEXT NOT NULL,
+  assigned_to TEXT NOT NULL,
+  completed_by TEXT NOT NULL,
+  completed_on TEXT NOT NULL,      -- YYYY-MM-DD
+  completed_at TEXT NOT NULL       -- ISO datetime string
 )
 """)
 
@@ -51,7 +65,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   chat_id INTEGER NOT NULL,
   user_id INTEGER NOT NULL,
   step TEXT NOT NULL,
-  data TEXT NOT NULL,              -- JSON blob as TEXT
+  data TEXT NOT NULL,
   PRIMARY KEY (chat_id, user_id)
 )
 """)
@@ -77,7 +91,7 @@ def today_str() -> str:
 def parse_hhmm(s: str) -> str:
     s = s.strip()
     if not TIME_RE.match(s):
-        raise ValueError("Time must be HH:MM")
+        raise ValueError("Time must be HH:MM (24h), e.g., 21:00")
     hh, mm = s.split(":")
     hh_i, mm_i = int(hh), int(mm)
     if not (0 <= hh_i <= 23 and 0 <= mm_i <= 59):
@@ -96,7 +110,6 @@ def set_people(p1: str, p2: str):
 def next_rotate_person(advance: bool = True) -> str:
     p1, p2, idx = get_people()
     if not p1 or not p2:
-        # If not configured, just return placeholder
         return "rotate"
     person = p1 if (idx % 2 == 0) else p2
     if advance:
@@ -124,42 +137,130 @@ def clear_session(chat_id: int, user_id: int):
     cur.execute("DELETE FROM sessions WHERE chat_id=? AND user_id=?", (chat_id, user_id))
     db.commit()
 
-def chore_is_due(chore_row) -> bool:
-    """
-    chore_row columns:
-      (id, name, mode, assignee, interval_days, time, last_done, last_reminded, skip_until)
-    due logic: due if last_done is NULL OR today >= last_done + interval_days
-    """
-    _, _, _, _, interval_days, _, last_done, _, skip_until = chore_row
-    today = date.today()
-
-    if skip_until and skip_until == today_str():
-        return False
-
+def next_due_date(last_done: str | None, interval_days: int) -> date:
+    # User confirmed: new chores are due immediately
     if not last_done:
-        # User said "YES" => new chores are due immediately
-        return True
-
+        return date.today()
     last = datetime.strptime(last_done, "%Y-%m-%d").date()
-    next_due = last + timedelta(days=int(interval_days))
-    return today >= next_due
+    return last + timedelta(days=int(interval_days))
+
+def days_until_due(chore_row) -> int:
+    # chore_row: (id,name,mode,assignee,interval_days,time,last_done,last_reminded,skip_until)
+    interval_days = int(chore_row[4])
+    last_done = chore_row[6]
+    due = next_due_date(last_done, interval_days)
+    return (due - date.today()).days
+
+def chore_is_due(chore_row) -> bool:
+    skip_until = chore_row[8]
+    if skip_until == today_str():
+        return False
+    return days_until_due(chore_row) <= 0
 
 def format_chore(chore_row) -> str:
     chore_id, name, mode, assignee, interval_days, time_str, last_done, _, skip_until = chore_row
-    if last_done:
-        last = datetime.strptime(last_done, "%Y-%m-%d").date()
-        next_due = (last + timedelta(days=int(interval_days))).strftime("%Y-%m-%d")
-    else:
-        next_due = "today"
-
+    due = next_due_date(last_done, int(interval_days)).strftime("%Y-%m-%d")
+    dleft = days_until_due(chore_row)
+    when = "due today" if dleft == 0 else ("overdue" if dleft < 0 else f"due in {dleft}d")
     skip_note = " (skipped today)" if skip_until == today_str() else ""
     mode_note = "rotate" if mode == "rotate" else "fixed"
-    return (f"{chore_id}) {name} — {assignee} ({mode_note}) — every {interval_days}d @ {time_str} — "
-            f"next due: {next_due}{skip_note}")
+    return f"{chore_id}) {name} — {assignee} ({mode_note}) — every {interval_days}d @ {time_str} — {when} ({due}){skip_note}"
 
-def send_to_household(text: str):
+def send_to_household(text: str, reply_markup=None):
     if CHAT_ID:
-        bot.send_message(int(CHAT_ID), text)
+        bot.send_message(int(CHAT_ID), text, reply_markup=reply_markup)
+
+def reminder_keyboard(chore_id: int):
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("Done ✅", callback_data=f"done:{chore_id}:self"),
+        InlineKeyboardButton("Done by other 👥", callback_data=f"done_other:{chore_id}")
+    )
+    kb.row(
+        InlineKeyboardButton("Skip ⏭️", callback_data=f"skip:{chore_id}")
+    )
+    return kb
+
+def done_other_keyboard(chore_id: int):
+    p1, p2, _ = get_people()
+    kb = InlineKeyboardMarkup()
+    # If names aren't set, still provide a generic flow
+    if p1 and p2:
+        kb.row(
+            InlineKeyboardButton(p1, callback_data=f"done:{chore_id}:{p1}"),
+            InlineKeyboardButton(p2, callback_data=f"done:{chore_id}:{p2}")
+        )
+    kb.row(InlineKeyboardButton("Cancel", callback_data=f"cancel_other:{chore_id}"))
+    return kb
+
+def record_completion(chore_id: int, completed_by: str):
+    cur.execute("""
+        SELECT id, name, mode, assignee, interval_days, time, last_done, last_reminded, skip_until
+        FROM chores
+        WHERE id=?
+    """, (chore_id,))
+    c = cur.fetchone()
+    if not c:
+        return False, "Chore not found."
+
+    _, name, mode, assigned_to, interval_days, time_str, last_done, last_reminded, skip_until = c
+    today = today_str()
+    now_iso = datetime.now().isoformat()
+
+    # Mark done (rolling schedule); keep assignment same (user's rule)
+    cur.execute("""
+        UPDATE chores
+        SET last_done=?, skip_until=NULL, last_reminded=NULL
+        WHERE id=?
+    """, (today, chore_id))
+
+    # Log completion (includes assigned_to vs completed_by)
+    cur.execute("""
+        INSERT INTO completions (chore_id, chore_name, assigned_to, completed_by, completed_on, completed_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (chore_id, name, assigned_to, completed_by, today, now_iso))
+
+    db.commit()
+
+    # If mode is rotate: we still keep assignment the same per your rule.
+    # (Rotation only matters when adding a rotate chore; responsibility stays constant afterward.)
+    return True, (name, assigned_to, completed_by, interval_days)
+def daily_digest_message():
+    cur.execute("""
+        SELECT id, name, assignee, interval_days, time, last_done, last_reminded, skip_until
+        FROM chores
+    """)
+    chores = cur.fetchall()
+
+    today = date.today()
+    due_today = []
+    due_next_3 = []
+
+    for c in chores:
+        d = days_until_due(c)
+        if d == 0:
+            due_today.append(c)
+        elif 1 <= d <= 3:
+            due_next_3.append((c, d))
+
+    lines = ["☀️ Good morning! Daily Chore Update\n"]
+
+    if due_today:
+        lines.append("📌 Due today:")
+        for c in due_today:
+            lines.append(f"• {c[1]} — {c[3]}")
+    else:
+        lines.append("📌 Due today:\n• None 🎉")
+
+    if due_next_3:
+        lines.append("\n🔜 Due in the next 3 days:")
+        for c, d in due_next_3:
+            lines.append(f"• {c[1]} — {c[3]} (in {d} day{'s' if d > 1 else ''})")
+    else:
+        lines.append("\n🔜 Due in the next 3 days:\n• None")
+
+    return "\n".join(lines)
+
 
 # --------------------
 # REMINDERS
@@ -176,20 +277,40 @@ def reminder_job():
 
         if time_str != now:
             continue
-
         if last_reminded == tday:
             continue
-
         if not chore_is_due(c):
             continue
 
-        send_to_household(f"🔔 Chore due: {name}\nAssigned to: {assignee}\nRepeat: every {interval_days} day(s)\nUse /done {chore_id} when finished.")
+        text = (
+            f"🔔 Chore due: {name}\n"
+            f"Assigned to: {assignee}\n"
+            f"Repeat: every {interval_days} day(s)\n"
+            f"Mark done: /done {chore_id}  (or use buttons)"
+        )
+        send_to_household(text, reply_markup=reminder_keyboard(chore_id))
+
         cur.execute("UPDATE chores SET last_reminded=? WHERE id=?", (tday, chore_id))
         db.commit()
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(reminder_job, "interval", minutes=1)
 scheduler.start()
+
+def daily_digest_job():
+    if not CHAT_ID:
+        return
+    message = daily_digest_message()
+    send_to_household(message)
+
+# Run every day at 08:00
+scheduler.add_job(
+    daily_digest_job,
+    trigger="cron",
+    hour=0,
+    minute=0
+)
+
 
 # --------------------
 # COMMANDS
@@ -198,31 +319,36 @@ scheduler.start()
 def cmd_help(message):
     bot.reply_to(
         message,
-        "👋 Household Chore Bot (rolling schedule)\n\n"
+        "👋 Household Chore Bot (rolling repeats)\n\n"
         "Setup:\n"
         "/setpeople Alex Sam\n\n"
         "Chores:\n"
         "/add  (wizard)\n"
         "/cancel\n"
-        "/list\n"
-        "/today\n"
-        "/done <id>\n"
+        "/list   (grouped by due window)\n"
+        "/today  (due & overdue)\n"
+        "/done <id> [who]\n"
         "/skip <id>\n"
         "/remove <id>\n\n"
+        "Review:\n"
+        "/history [days|name|person]\n"
+        "/summary [days]\n"
+        "/stats\n\n"
         "Notes:\n"
-        "- Repeats are rolling: next due = last_done + interval_days\n"
-        "- New chores are due immediately (until first /done)\n"
+        "- Next due = last_done + interval_days\n"
+        "- New chores are due immediately until first done.\n"
+        "- If someone else does it, use: /done <id> wife (assignment stays the same)\n"
     )
 
 @bot.message_handler(commands=["setpeople"])
 def cmd_setpeople(message):
     parts = message.text.split(maxsplit=2)
     if len(parts) < 3:
-        bot.reply_to(message, "Usage: /setpeople Person1 Person2\nExample: /setpeople Alex Sam")
+        bot.reply_to(message, "Usage: /setpeople Person1 Person2\nExample: /setpeople Husband Wife")
         return
     p1, p2 = parts[1].strip(), parts[2].strip()
     set_people(p1, p2)
-    bot.reply_to(message, f"✅ Set household people:\n1) {p1}\n2) {p2}\nRotation will alternate between them.")
+    bot.reply_to(message, f"✅ Household people set:\n1) {p1}\n2) {p2}\n(Used for /add rotate + button choices)")
 
 @bot.message_handler(commands=["cancel"])
 def cmd_cancel(message):
@@ -240,11 +366,38 @@ def cmd_add(message):
 def cmd_list(message):
     cur.execute("SELECT id, name, mode, assignee, interval_days, time, last_done, last_reminded, skip_until FROM chores ORDER BY id")
     chores = cur.fetchall()
+
     if not chores:
         bot.reply_to(message, "No chores yet. Use /add to create one.")
         return
-    text = "📋 All chores:\n" + "\n".join(format_chore(c) for c in chores)
-    bot.reply_to(message, text)
+
+    overdue, d03, d47, d814, later = [], [], [], [], []
+    for c in chores:
+        d = days_until_due(c)
+        if chore_is_due(c) and d < 0:
+            overdue.append(c)
+        elif d <= 3:
+            d03.append(c)
+        elif d <= 7:
+            d47.append(c)
+        elif d <= 14:
+            d814.append(c)
+        else:
+            later.append(c)
+
+    parts = []
+    if overdue:
+        parts.append("⛔ Overdue:\n" + "\n".join(format_chore(x) for x in overdue))
+    if d03:
+        parts.append("🟠 Due in 0–3 days:\n" + "\n".join(format_chore(x) for x in d03))
+    if d47:
+        parts.append("🟡 Due in 4–7 days:\n" + "\n".join(format_chore(x) for x in d47))
+    if d814:
+        parts.append("🟢 Due in 8–14 days:\n" + "\n".join(format_chore(x) for x in d814))
+    if later:
+        parts.append("🔵 Due later:\n" + "\n".join(format_chore(x) for x in later))
+
+    bot.reply_to(message, "\n\n".join(parts))
 
 @bot.message_handler(commands=["today"])
 def cmd_today(message):
@@ -254,63 +407,33 @@ def cmd_today(message):
     if not due:
         bot.reply_to(message, "✅ No chores due right now.")
         return
-    text = "📅 Due / overdue chores:\n" + "\n".join(format_chore(c) for c in due)
-    bot.reply_to(message, text)
-
-@bot.message_handler(commands=["history"])
-def cmd_history(message):
-    cur.execute("""
-        SELECT id, name, assignee, interval_days, last_done
-        FROM chores
-        WHERE last_done IS NOT NULL
-        ORDER BY last_done DESC
-        LIMIT 20
-    """)
-    rows = cur.fetchall()
-
-    if not rows:
-        bot.reply_to(message, "📜 No completed chores yet.")
-        return
-
-    lines = ["📜 Chore history (most recent first):\n"]
-    for c in rows:
-        chore_id, name, assignee, interval_days, last_done = c
-        lines.append(
-            f"{chore_id}) {name} — {assignee}\n"
-            f"   Last done: {last_done}\n"
-            f"   Repeat: every {interval_days} day(s)\n"
-        )
-
-    bot.reply_to(message, "\n".join(lines))
-
+    bot.reply_to(message, "📅 Due / overdue:\n" + "\n".join(format_chore(c) for c in due))
 
 @bot.message_handler(commands=["done"])
 def cmd_done(message):
-    parts = message.text.split(maxsplit=1)
+    # /done <id> [who]
+    parts = message.text.split(maxsplit=2)
     if len(parts) < 2 or not parts[1].isdigit():
-        bot.reply_to(message, "Usage: /done <id>\nExample: /done 2")
+        bot.reply_to(message, "Usage: /done <id> [who]\nExamples:\n/done 3\n/done 3 wife")
         return
+
     chore_id = int(parts[1])
-    tday = today_str()
+    completed_by = parts[2].strip() if len(parts) == 3 else message.from_user.first_name
 
-    cur.execute("SELECT id, name, mode, assignee, interval_days, time, last_done, last_reminded, skip_until FROM chores WHERE id=?", (chore_id,))
-    c = cur.fetchone()
-    if not c:
-        bot.reply_to(message, f"Chore #{chore_id} not found.")
+    ok, result = record_completion(chore_id, completed_by)
+    if not ok:
+        bot.reply_to(message, f"❌ {result}")
         return
 
-    # mark done today; clear skip & reminder marker so next due is computed from today
-    cur.execute("UPDATE chores SET last_done=?, skip_until=NULL, last_reminded=NULL WHERE id=?", (tday, chore_id))
-    db.commit()
-
-    # rotation: assign next person immediately for next cycle
-    if c[2] == "rotate":
-        nxt = next_rotate_person(advance=True)
-        cur.execute("UPDATE chores SET assignee=? WHERE id=?", (nxt, chore_id))
-        db.commit()
-        bot.reply_to(message, f"🎉 Done! Next time assigned to: {nxt}")
+    name, assigned_to, completed_by, interval_days = result
+    if completed_by.lower() != assigned_to.lower():
+        bot.reply_to(
+            message,
+            f"✅ {name} marked done.\nAssigned to: {assigned_to}\nCompleted by: {completed_by}\n"
+            f"Next due will be in {interval_days} day(s)."
+        )
     else:
-        bot.reply_to(message, "🎉 Marked done!")
+        bot.reply_to(message, f"🎉 {name} marked done! Next due in {interval_days} day(s).")
 
 @bot.message_handler(commands=["skip"])
 def cmd_skip(message):
@@ -338,12 +461,213 @@ def cmd_remove(message):
     db.commit()
     bot.reply_to(message, "🗑️ Removed.")
 
+@bot.message_handler(commands=["history"])
+def cmd_history(message):
+    """
+    /history
+    /history 7         -> last 7 days
+    /history wife      -> filter completed_by contains 'wife'
+    /history mopping   -> filter chore_name contains 'mopping'
+    """
+    arg = message.text.split(maxsplit=1)[1].strip() if len(message.text.split(maxsplit=1)) == 2 else ""
+    where = []
+    params = []
+
+    if arg:
+        if arg.isdigit():
+            days = int(arg)
+            since = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+            where.append("completed_on >= ?")
+            params.append(since)
+        else:
+            # filter by completed_by or chore_name substring
+            where.append("(LOWER(completed_by) LIKE ? OR LOWER(chore_name) LIKE ? OR LOWER(assigned_to) LIKE ?)")
+            like = f"%{arg.lower()}%"
+            params.extend([like, like, like])
+
+    sql = """
+      SELECT chore_name, assigned_to, completed_by, completed_on
+      FROM completions
+    """
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY completed_at DESC LIMIT 50"
+
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+
+    if not rows:
+        bot.reply_to(message, "📜 No matching history yet.")
+        return
+
+    lines = ["📜 History (most recent first):\n"]
+    for name, assigned_to, completed_by, completed_on in rows:
+        if completed_by.lower() != assigned_to.lower():
+            lines.append(f"• {name} — assigned to {assigned_to}, completed by {completed_by} on {completed_on}")
+        else:
+            lines.append(f"• {name} — {completed_by} on {completed_on}")
+
+    bot.reply_to(message, "\n".join(lines))
+
+@bot.message_handler(commands=["summary"])
+def cmd_summary(message):
+    """
+    /summary
+    /summary 7
+    """
+    days = 7
+    parts = message.text.split(maxsplit=1)
+    if len(parts) == 2 and parts[1].strip().isdigit():
+        days = int(parts[1].strip())
+
+    since = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    # totals by completed_by
+    cur.execute("""
+        SELECT completed_by, COUNT(*)
+        FROM completions
+        WHERE completed_on >= ?
+        GROUP BY completed_by
+        ORDER BY COUNT(*) DESC
+    """, (since,))
+    by_doer = cur.fetchall()
+
+    # cover events (completed_by != assigned_to)
+    cur.execute("""
+        SELECT assigned_to, completed_by, COUNT(*)
+        FROM completions
+        WHERE completed_on >= ?
+          AND LOWER(assigned_to) != LOWER(completed_by)
+        GROUP BY assigned_to, completed_by
+        ORDER BY COUNT(*) DESC
+    """, (since,))
+    covers = cur.fetchall()
+
+    lines = [f"📈 Summary (last {days} days, since {since}):\n"]
+
+    if by_doer:
+        lines.append("✅ Completed chores (by who did it):")
+        for who, cnt in by_doer:
+            lines.append(f"• {who}: {cnt}")
+    else:
+        lines.append("No completions in this period.")
+
+    if covers:
+        lines.append("\n🤝 Covering/helping events (assigned → completed by):")
+        for assigned_to, completed_by, cnt in covers:
+            lines.append(f"• {assigned_to} → {completed_by}: {cnt}")
+    else:
+        lines.append("\nNo covering events in this period.")
+
+    bot.reply_to(message, "\n".join(lines))
+
+@bot.message_handler(commands=["stats"])
+def cmd_stats(message):
+    # lifetime stats
+    cur.execute("""
+        SELECT completed_by, COUNT(*)
+        FROM completions
+        GROUP BY completed_by
+        ORDER BY COUNT(*) DESC
+    """)
+    by_doer = cur.fetchall()
+
+    cur.execute("""
+        SELECT assigned_to, COUNT(*)
+        FROM completions
+        GROUP BY assigned_to
+        ORDER BY COUNT(*) DESC
+    """)
+    by_assigned = cur.fetchall()
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM completions
+        WHERE LOWER(assigned_to) != LOWER(completed_by)
+    """)
+    cover_count = cur.fetchone()[0]
+
+    lines = ["📊 Lifetime stats:\n"]
+
+    if by_doer:
+        lines.append("✅ Completed (who did it):")
+        for who, cnt in by_doer:
+            lines.append(f"• {who}: {cnt}")
+
+    if by_assigned:
+        lines.append("\n🎯 Responsibility (who it was assigned to):")
+        for who, cnt in by_assigned:
+            lines.append(f"• {who}: {cnt}")
+
+    lines.append(f"\n🤝 Total covers (someone else did it): {cover_count}")
+    bot.reply_to(message, "\n".join(lines))
+
+# --------------------
+# INLINE BUTTON HANDLERS
+# --------------------
+@bot.callback_query_handler(func=lambda call: True)
+def callbacks(call):
+    try:
+        data = call.data or ""
+
+        if data.startswith("done_other:"):
+            chore_id = int(data.split(":")[1])
+            bot.answer_callback_query(call.id)
+            bot.send_message(call.message.chat.id, "Who completed it?", reply_markup=done_other_keyboard(chore_id))
+            return
+
+        if data.startswith("cancel_other:"):
+            bot.answer_callback_query(call.id, "Cancelled")
+            return
+
+        if data.startswith("skip:"):
+            chore_id = int(data.split(":")[1])
+            cur.execute("UPDATE chores SET skip_until=? WHERE id=?", (today_str(), chore_id))
+            db.commit()
+            bot.answer_callback_query(call.id, "Skipped for today")
+            bot.send_message(call.message.chat.id, f"⏭️ Skipped chore #{chore_id} for today.")
+            return
+
+        if data.startswith("done:"):
+            # done:<id>:self OR done:<id>:<name>
+            _, chore_id_s, who = data.split(":", 2)
+            chore_id = int(chore_id_s)
+
+            if who == "self":
+                completed_by = call.from_user.first_name
+            else:
+                completed_by = who
+
+            ok, result = record_completion(chore_id, completed_by)
+            if not ok:
+                bot.answer_callback_query(call.id, "Error")
+                bot.send_message(call.message.chat.id, f"❌ {result}")
+                return
+
+            name, assigned_to, completed_by, interval_days = result
+            bot.answer_callback_query(call.id, "Marked done")
+
+            if completed_by.lower() != assigned_to.lower():
+                bot.send_message(
+                    call.message.chat.id,
+                    f"✅ {name} marked done.\nAssigned to: {assigned_to}\nCompleted by: {completed_by}\nNext due in {interval_days} day(s)."
+                )
+            else:
+                bot.send_message(call.message.chat.id, f"🎉 {name} marked done! Next due in {interval_days} day(s).")
+
+            return
+
+        bot.answer_callback_query(call.id)
+
+    except Exception as e:
+        bot.answer_callback_query(call.id, "Error")
+        bot.send_message(call.message.chat.id, f"❌ Callback error: {e}")
+
 # --------------------
 # WIZARD (session-driven)
 # --------------------
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def wizard_handler(message):
-    # ignore commands here (handled above)
     if message.text.startswith("/"):
         return
 
@@ -364,19 +688,19 @@ def wizard_handler(message):
 
             p1, p2, _ = get_people()
             if p1 and p2:
-                bot.reply_to(message, f"Step 2/4: Who is it assigned to?\nReply with: {p1} / {p2} / rotate")
+                bot.reply_to(message, f"Step 2/4: Who is it assigned to?\nReply: {p1} / {p2} / rotate")
             else:
-                bot.reply_to(message, "Step 2/4: Who is it assigned to?\nReply with a name (e.g., Alex) or 'rotate'.\nTip: set /setpeople first for rotation.")
+                bot.reply_to(message, "Step 2/4: Who is it assigned to?\nReply with a name or 'rotate'. (Tip: /setpeople first)")
 
         elif step == "ASK_ASSIGNEE":
             p1, p2, _ = get_people()
             if text.lower() == "rotate":
                 data["mode"] = "rotate"
-                # assign current person now, advance rotation for fairness
+                # Assign responsibility now (rotation is used only to pick initial assignee)
                 data["assignee"] = next_rotate_person(advance=True)
             else:
                 data["mode"] = "fixed"
-                data["assignee"] = text  # allow any name; household names recommended
+                data["assignee"] = text
 
             save_session(message.chat.id, message.from_user.id, "ASK_INTERVAL", data)
             bot.reply_to(message, "Step 3/4: Repeat every how many days?\nReply with a number (e.g., 7)")
@@ -387,7 +711,7 @@ def wizard_handler(message):
                 return
             interval_days = int(text)
             if interval_days < 1 or interval_days > 365:
-                bot.reply_to(message, "Please choose a sensible interval (1–365).")
+                bot.reply_to(message, "Please choose an interval from 1–365.")
                 return
             data["interval_days"] = interval_days
             save_session(message.chat.id, message.from_user.id, "ASK_TIME", data)
@@ -397,7 +721,6 @@ def wizard_handler(message):
             time_str = parse_hhmm(text)
             data["time"] = time_str
 
-            # Save chore
             cur.execute(
                 "INSERT INTO chores (name, mode, assignee, interval_days, time, last_done, last_reminded, skip_until) "
                 "VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)",
@@ -414,17 +737,15 @@ def wizard_handler(message):
                 f"Assigned to: {data['assignee']} ({data['mode']})\n"
                 f"Repeat: every {data['interval_days']} day(s)\n"
                 f"Reminder time: {data['time']}\n\n"
-                "New chores are due immediately until you mark them done with /done <id>.\n"
-                "Use /list to see the id."
+                "Use /list to see all chores and IDs."
             )
 
         else:
             clear_session(message.chat.id, message.from_user.id)
             bot.reply_to(message, "Session reset. Use /add to start again.")
-    except Exception as e:
-        # keep it user-friendly
-        bot.reply_to(message, f"❌ Something went wrong: {e}\nType /cancel then /add to try again.")
 
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {e}\nType /cancel then /add to try again.")
 
 # --------------------
 # START
