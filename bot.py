@@ -890,4 +890,26 @@ def wizard_handler(message):
 # --------------------
 # START
 # --------------------
+
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, format, *args):
+            return  # silence logs
+
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    server.serve_forever()
+
+threading.Thread(target=start_health_server, daemon=True).start()
+
 bot.infinity_polling()
