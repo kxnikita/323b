@@ -257,6 +257,33 @@ def cmd_today(message):
     text = "📅 Due / overdue chores:\n" + "\n".join(format_chore(c) for c in due)
     bot.reply_to(message, text)
 
+@bot.message_handler(commands=["history"])
+def cmd_history(message):
+    cur.execute("""
+        SELECT id, name, assignee, interval_days, last_done
+        FROM chores
+        WHERE last_done IS NOT NULL
+        ORDER BY last_done DESC
+        LIMIT 20
+    """)
+    rows = cur.fetchall()
+
+    if not rows:
+        bot.reply_to(message, "📜 No completed chores yet.")
+        return
+
+    lines = ["📜 Chore history (most recent first):\n"]
+    for c in rows:
+        chore_id, name, assignee, interval_days, last_done = c
+        lines.append(
+            f"{chore_id}) {name} — {assignee}\n"
+            f"   Last done: {last_done}\n"
+            f"   Repeat: every {interval_days} day(s)\n"
+        )
+
+    bot.reply_to(message, "\n".join(lines))
+
+
 @bot.message_handler(commands=["done"])
 def cmd_done(message):
     parts = message.text.split(maxsplit=1)
